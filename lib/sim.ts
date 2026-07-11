@@ -1,4 +1,4 @@
-export type ValidatorStatus = "Idle";
+export type ValidatorStatus = "Idle" | "Proposed";
 
 export interface SimMessage {
   from: number;
@@ -10,6 +10,19 @@ export interface SimMessage {
   label?: string;
 }
 
+export interface ChunkPayload {
+  proposerId: number;
+  chunkIndex: number;
+  id: string;
+}
+
+export interface Proposal {
+  proposerId: number;
+  id: string;
+  txIds: string[];
+  locked: true;
+}
+
 export interface Validator {
   id: number;
   inbox: SimMessage[];
@@ -19,9 +32,11 @@ export interface Validator {
 export interface SimState {
   slot: number;
   deadlineMs: number;
+  deadlineAt: number | null;
   clock: number;
   validators: Validator[];
   proposers: number[];
+  proposals: Proposal[];
   inFlight: SimMessage[];
   log: string[];
   chain: unknown[];
@@ -62,10 +77,20 @@ export function deliveryDelay(): number {
   return Math.round(60 + (Math.random() * 2 - 1) * 30);
 }
 
+/** Fake Merkle root: a short 4-hex-char id hashed from the proposer + tx ids. */
+export function shortHash(input: string): string {
+  let h = 0;
+  for (let i = 0; i < input.length; i++) {
+    h = (h * 31 + input.charCodeAt(i)) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0").slice(0, 4);
+}
+
 export function createInitialState(n: number): SimState {
   return {
     slot: INITIAL_SLOT,
     deadlineMs: DEADLINE_MS,
+    deadlineAt: null,
     clock: 0,
     validators: Array.from({ length: n }, (_, id) => ({
       id,
@@ -73,19 +98,31 @@ export function createInitialState(n: number): SimState {
       status: "Idle",
     })),
     proposers: proposersForSlot(INITIAL_SLOT, n),
+    proposals: [],
     inFlight: [],
     log: [],
     chain: [],
   };
 }
 
+export interface ProposalInput {
+  proposerId: number;
+  id: string;
+  txIds: string[];
+}
+
 export type SimAction =
   | { type: "SET_N"; n: number }
   | { type: "RESET"; n: number }
   | { type: "SEND"; from: number; to: number; msgType: string; payload?: unknown; delay: number; label?: string }
-  | { type: "TICK"; step: number };
+  | { type: "TICK"; step: number }
+  | { type: "PROPOSE"; proposals: ProposalInput[] };
 
 function formatDelivery(m: SimMessage): string {
+  if (m.type === "chunk") {
+    const { id } = m.payload as ChunkPayload;
+    return `[${m.arrivesAt}ms] Proposer ${m.from} -> Validator ${m.to}: chunk (id ${id})`;
+  }
   return `[${m.arrivesAt}ms] Validator ${m.from} -> Validator ${m.to}: ${m.type}`;
 }
 
@@ -107,6 +144,20 @@ export function simReducer(state: SimState, action: SimAction): SimState {
         label: action.label,
       };
       return { ...state, inFlight: [...state.inFlight, message] };
+    }
+    case "PROPOSE": {
+      if (state.proposals.length > 0) return state;
+      const proposerIds = new Set(action.proposals.map((p) => p.proposerId));
+      const validators = state.validators.map((v) =>
+        proposerIds.has(v.id) ? { ...v, status: "Proposed" as ValidatorStatus } : v
+      );
+      const proposals = action.proposals.map((p) => ({ ...p, locked: true as const }));
+      return {
+        ...state,
+        validators,
+        proposals: [...state.proposals, ...proposals],
+        deadlineAt: state.clock + state.deadlineMs,
+      };
     }
     case "TICK": {
       const clock = state.clock + action.step;

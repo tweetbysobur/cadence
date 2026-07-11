@@ -1,6 +1,7 @@
 "use client";
 
 import { HoverStat } from "@/components/HoverStat";
+import { ProposalChip } from "@/components/ProposalChip";
 import { deriveThresholds } from "@/lib/sim";
 import { useSim } from "@/lib/useSim";
 
@@ -9,10 +10,15 @@ const MAX_N = 22;
 const DEFAULT_N = 10;
 
 export default function Home() {
-  const { state, running, setN, reset } = useSim(DEFAULT_N);
+  const { state, running, setN, reset, propose } = useSim(DEFAULT_N);
   const n = state.validators.length;
   const { f, quorum, rebuild } = deriveThresholds(n);
   const sliderFill = ((n - MIN_N) / (MAX_N - MIN_N)) * 100;
+
+  const deadlineRemaining =
+    state.deadlineAt !== null ? Math.max(0, state.deadlineAt - state.clock) : state.deadlineMs;
+  const deadlinePassed = state.deadlineAt !== null && state.clock >= state.deadlineAt;
+  const canPropose = state.proposals.length === 0;
 
   return (
     <div className="mx-auto flex w-full max-w-[1150px] flex-1 flex-col gap-6 px-6 py-10">
@@ -49,7 +55,7 @@ export default function Home() {
         <div className="flex flex-wrap items-center gap-x-8 gap-y-4">
           <Stat label="Slot" value={state.slot} />
           <Divider />
-          <Stat label="Deadline" value={`${state.deadlineMs} ms`} />
+          <Stat label="Deadline" value={`${deadlineRemaining} ms`} />
           <Divider />
           <div className="flex items-center gap-2">
             <Stat label="Clock" value={`${state.clock} ms`} mono />
@@ -76,9 +82,9 @@ export default function Home() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <StageButton label="Propose" />
-          <StageButton label="First Vote" />
-          <StageButton label="Commit Vote" />
+          <StageButton label="Propose" disabled={!canPropose} onClick={propose} />
+          <StageButton label="First Vote" disabled={!deadlinePassed} />
+          <StageButton label="Commit Vote" disabled />
           <button
             type="button"
             onClick={() => reset(n)}
@@ -94,6 +100,7 @@ export default function Home() {
         <div className="flex flex-wrap gap-3">
           {state.validators.map((v) => {
             const isProposer = state.proposers.includes(v.id);
+            const proposal = state.proposals.find((p) => p.proposerId === v.id);
             return (
               <div
                 key={v.id}
@@ -121,6 +128,7 @@ export default function Home() {
                     inbox {v.inbox.length}
                   </span>
                 </div>
+                {proposal && <ProposalChip id={proposal.id} />}
               </div>
             );
           })}
@@ -182,12 +190,25 @@ function Divider() {
   return <span className="hidden h-8 w-px bg-border sm:block" />;
 }
 
-function StageButton({ label }: { label: string }) {
+function StageButton({
+  label,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  disabled?: boolean;
+  onClick?: () => void;
+}) {
   return (
     <button
       type="button"
-      disabled
-      className="cursor-not-allowed rounded-lg border border-border-soft bg-surface/50 px-4 py-2 text-sm font-medium text-muted-soft opacity-60"
+      disabled={disabled}
+      onClick={onClick}
+      className={
+        disabled
+          ? "cursor-not-allowed rounded-lg border border-border-soft bg-surface/50 px-4 py-2 text-sm font-medium text-muted-soft opacity-60"
+          : "rounded-lg border border-accent-border bg-accent-soft px-4 py-2 text-sm font-medium text-accent transition-colors duration-150 hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-border"
+      }
     >
       {label}
     </button>
