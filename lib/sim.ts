@@ -1,4 +1,4 @@
-export type ValidatorStatus = "Idle" | "Proposed";
+export type ValidatorStatus = "Idle" | "Proposed" | "Voted";
 
 export interface SimMessage {
   from: number;
@@ -16,6 +16,16 @@ export interface ChunkPayload {
   id: string;
 }
 
+export interface VotePayload {
+  type: "yes" | "no";
+  proposerId: number;
+  voterId: number;
+  /** The voter's share of the decryption key. */
+  keyPiece: number;
+  id?: string;
+  chunk?: ChunkPayload;
+}
+
 export interface Proposal {
   proposerId: number;
   id: string;
@@ -29,6 +39,11 @@ export interface Validator {
   status: ValidatorStatus;
 }
 
+export interface Tally {
+  yes: number[];
+  no: number[];
+}
+
 export interface SimState {
   slot: number;
   deadlineMs: number;
@@ -37,6 +52,10 @@ export interface SimState {
   validators: Validator[];
   proposers: number[];
   proposals: Proposal[];
+  votesCast: boolean;
+  tallies: Record<number, Tally>;
+  keyPieces: number[];
+  decrypted: boolean;
   inFlight: SimMessage[];
   log: string[];
   chain: unknown[];
@@ -99,6 +118,10 @@ export function createInitialState(n: number): SimState {
     })),
     proposers: proposersForSlot(INITIAL_SLOT, n),
     proposals: [],
+    votesCast: false,
+    tallies: {},
+    keyPieces: [],
+    decrypted: false,
     inFlight: [],
     log: [],
     chain: [],
@@ -116,12 +139,17 @@ export type SimAction =
   | { type: "RESET"; n: number }
   | { type: "SEND"; from: number; to: number; msgType: string; payload?: unknown; delay: number; label?: string }
   | { type: "TICK"; step: number }
-  | { type: "PROPOSE"; proposals: ProposalInput[] };
+  | { type: "PROPOSE"; proposals: ProposalInput[] }
+  | { type: "FIRST_VOTE" };
 
 function formatDelivery(m: SimMessage): string {
   if (m.type === "chunk") {
     const { id } = m.payload as ChunkPayload;
     return `[${m.arrivesAt}ms] Proposer ${m.from} -> Validator ${m.to}: chunk (id ${id})`;
+  }
+  if (m.type === "vote") {
+    const v = m.payload as VotePayload;
+    return `[${m.arrivesAt}ms] Validator ${m.from} -> Validator ${m.to}: vote proposer ${v.proposerId} (${v.type})`;
   }
   return `[${m.arrivesAt}ms] Validator ${m.from} -> Validator ${m.to}: ${m.type}`;
 }
@@ -159,6 +187,14 @@ export function simReducer(state: SimState, action: SimAction): SimState {
         deadlineAt: state.clock + state.deadlineMs,
       };
     }
+    case "FIRST_VOTE": {
+      if (state.votesCast) return state;
+      return {
+        ...state,
+        votesCast: true,
+        validators: state.validators.map((v) => ({ ...v, status: "Voted" as ValidatorStatus })),
+      };
+    }
     case "TICK": {
       const clock = state.clock + action.step;
       const arrived = state.inFlight.filter((m) => m.arrivesAt <= clock);
@@ -168,11 +204,43 @@ export function simReducer(state: SimState, action: SimAction): SimState {
       const stillInFlight = state.inFlight.filter((m) => m.arrivesAt > clock);
       const validators = state.validators.map((v) => ({ ...v, inbox: v.inbox.slice() }));
       const log = state.log.slice();
+
+      const tallies: Record<number, Tally> = {};
+      for (const proposerId of Object.keys(state.tallies)) {
+        const t = state.tallies[Number(proposerId)];
+        tallies[Number(proposerId)] = { yes: t.yes.slice(), no: t.no.slice() };
+      }
+      const keyPieces = state.keyPieces.slice();
+      let decrypted = state.decrypted;
+
       for (const m of arrived) {
         validators[m.to].inbox.push(m);
         log.push(formatDelivery(m));
+
+        if (m.type === "vote") {
+          const vote = m.payload as VotePayload;
+          const bucket = tallies[vote.proposerId] ?? { yes: [], no: [] };
+          const alreadyCounted = bucket.yes.includes(vote.voterId) || bucket.no.includes(vote.voterId);
+          if (!alreadyCounted) {
+            (vote.type === "yes" ? bucket.yes : bucket.no).push(vote.voterId);
+          }
+          tallies[vote.proposerId] = bucket;
+
+          if (!keyPieces.includes(vote.keyPiece)) {
+            keyPieces.push(vote.keyPiece);
+          }
+        }
       }
-      return { ...state, clock, inFlight: stillInFlight, validators, log };
+
+      if (!decrypted) {
+        const { rebuild } = deriveThresholds(validators.length);
+        if (keyPieces.length >= rebuild) {
+          decrypted = true;
+          log.push(`[${clock}ms] ${rebuild} key pieces collected — proposals decrypted`);
+        }
+      }
+
+      return { ...state, clock, inFlight: stillInFlight, validators, log, tallies, keyPieces, decrypted };
     }
     default:
       return state;

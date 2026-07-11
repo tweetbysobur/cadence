@@ -10,15 +10,17 @@ const MAX_N = 22;
 const DEFAULT_N = 10;
 
 export default function Home() {
-  const { state, running, setN, reset, propose } = useSim(DEFAULT_N);
+  const { state, running, setN, reset, propose, firstVote } = useSim(DEFAULT_N);
   const n = state.validators.length;
   const { f, quorum, rebuild } = deriveThresholds(n);
+  const outThreshold = n - quorum + 1;
   const sliderFill = ((n - MIN_N) / (MAX_N - MIN_N)) * 100;
 
   const deadlineRemaining =
     state.deadlineAt !== null ? Math.max(0, state.deadlineAt - state.clock) : state.deadlineMs;
   const deadlinePassed = state.deadlineAt !== null && state.clock >= state.deadlineAt;
   const canPropose = state.proposals.length === 0;
+  const canFirstVote = deadlinePassed && !state.votesCast;
 
   return (
     <div className="mx-auto flex w-full max-w-[1150px] flex-1 flex-col gap-6 px-6 py-10">
@@ -83,7 +85,7 @@ export default function Home() {
 
         <div className="flex flex-wrap items-center gap-2">
           <StageButton label="Propose" disabled={!canPropose} onClick={propose} />
-          <StageButton label="First Vote" disabled={!deadlinePassed} />
+          <StageButton label="First Vote" disabled={!canFirstVote} onClick={firstVote} />
           <StageButton label="Commit Vote" disabled />
           <button
             type="button"
@@ -128,7 +130,17 @@ export default function Home() {
                     inbox {v.inbox.length}
                   </span>
                 </div>
-                {proposal && <ProposalChip id={proposal.id} />}
+                {proposal && (
+                  <ProposalChip
+                    id={proposal.id}
+                    txIds={proposal.txIds}
+                    decrypted={state.decrypted}
+                    yes={state.tallies[proposal.proposerId]?.yes.length ?? 0}
+                    no={state.tallies[proposal.proposerId]?.no.length ?? 0}
+                    quorum={quorum}
+                    outThreshold={outThreshold}
+                  />
+                )}
               </div>
             );
           })}
