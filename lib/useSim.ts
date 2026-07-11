@@ -1,24 +1,16 @@
 "use client";
 
 import { useCallback, useEffect, useReducer } from "react";
-import {
-  ChunkPayload,
-  createInitialState,
-  deliveryDelay,
-  deriveThresholds,
-  shortHash,
-  simReducer,
-  VotePayload,
-} from "./sim";
+import { createInitialState, DEFAULT_TAU, simReducer } from "./sim";
 
 const TICK_STEP_MS = 10;
 const TICK_INTERVAL_MS = 20;
 
 export function useSim(defaultN: number) {
-  const [state, dispatch] = useReducer(simReducer, defaultN, createInitialState);
+  const [state, dispatch] = useReducer(simReducer, defaultN, (n) => createInitialState(n, DEFAULT_TAU));
 
-  const deadlinePending = state.deadlineAt !== null && state.clock < state.deadlineAt;
-  const running = state.inFlight.length > 0 || deadlinePending;
+  // Keep ticking whenever there's a conductor running or any slot still in progress.
+  const running = state.autoRun || state.inFlight.length > 0 || state.slots.length > 0;
 
   useEffect(() => {
     if (!running) return;
@@ -29,125 +21,12 @@ export function useSim(defaultN: number) {
   }, [running]);
 
   const setN = useCallback((n: number) => dispatch({ type: "SET_N", n }), []);
-  const reset = useCallback((n: number) => dispatch({ type: "RESET", n }), []);
+  const reset = useCallback(() => dispatch({ type: "RESET" }), []);
+  const setTau = useCallback((tau: number) => dispatch({ type: "SET_TAU", tau }), []);
+  const setAutoRun = useCallback((on: boolean) => dispatch({ type: "SET_AUTO_RUN", on }), []);
+  const manualPropose = useCallback(() => dispatch({ type: "MANUAL_PROPOSE" }), []);
+  const manualFirstVote = useCallback(() => dispatch({ type: "MANUAL_FIRST_VOTE" }), []);
+  const manualCommitVote = useCallback(() => dispatch({ type: "MANUAL_COMMIT_VOTE" }), []);
 
-  /** Schedules one message through the simulated delivery model. */
-  const send = useCallback(
-    (from: number, to: number, type: string, payload?: unknown, label?: string) => {
-      dispatch({ type: "SEND", from, to, msgType: type, payload, delay: deliveryDelay(), label });
-    },
-    []
-  );
-
-  /**
-   * Each proposer simultaneously creates a proposal (3 fake tx ids, hashed
-   * into a short id) and splits it into N chunks, one per validator, sent
-   * through the delivery model.
-   */
-  const propose = useCallback(() => {
-    if (state.proposals.length > 0) return;
-    const n = state.validators.length;
-
-    const proposals = state.proposers.map((proposerId) => {
-      const txIds = Array.from({ length: 3 }, () => Math.random().toString(16).slice(2, 10));
-      const id = shortHash(`${proposerId}:${txIds.join(",")}`);
-      return { proposerId, id, txIds };
-    });
-
-    dispatch({ type: "PROPOSE", proposals });
-
-    for (const { proposerId, id } of proposals) {
-      for (let chunkIndex = 0; chunkIndex < n; chunkIndex++) {
-        dispatch({
-          type: "SEND",
-          from: proposerId,
-          to: chunkIndex,
-          msgType: "chunk",
-          payload: { proposerId, chunkIndex, id },
-          delay: deliveryDelay(),
-        });
-      }
-    }
-  }, [state.proposals.length, state.proposers, state.validators.length]);
-
-  /**
-   * Every validator casts one vote per proposer based on its inbox (yes if
-   * that proposer's chunk arrived before the deadline, no otherwise), each
-   * carrying the voter's key piece, and broadcasts it to every validator.
-   */
-  const firstVote = useCallback(() => {
-    if (state.votesCast) return;
-    const n = state.validators.length;
-    const deadlineAt = state.deadlineAt ?? Infinity;
-
-    for (let voterId = 0; voterId < n; voterId++) {
-      const inbox = state.validators[voterId].inbox;
-      for (const proposerId of state.proposers) {
-        const chunkMsg = inbox.find(
-          (m) =>
-            m.type === "chunk" &&
-            (m.payload as ChunkPayload).proposerId === proposerId &&
-            m.arrivesAt <= deadlineAt
-        );
-        const vote: VotePayload = chunkMsg
-          ? {
-              type: "yes",
-              proposerId,
-              voterId,
-              keyPiece: voterId,
-              id: (chunkMsg.payload as ChunkPayload).id,
-              chunk: chunkMsg.payload as ChunkPayload,
-            }
-          : { type: "no", proposerId, voterId, keyPiece: voterId };
-
-        for (let recipient = 0; recipient < n; recipient++) {
-          dispatch({
-            type: "SEND",
-            from: voterId,
-            to: recipient,
-            msgType: "vote",
-            payload: vote,
-            delay: deliveryDelay(),
-          });
-        }
-      }
-    }
-
-    dispatch({ type: "FIRST_VOTE" });
-  }, [state.votesCast, state.validators, state.proposers, state.deadlineAt]);
-
-  /**
-   * Once every proposer has decided (speculative finality), every validator
-   * broadcasts a commit vote carrying a digest of its recorded
-   * included-proposal set to every validator.
-   */
-  const commitVote = useCallback(() => {
-    if (state.committed || state.specAt === null) return;
-    const n = state.validators.length;
-    const { quorum } = deriveThresholds(n);
-
-    const includedIds = state.proposers
-      .filter((p) => (state.tallies[p]?.yes.length ?? 0) >= quorum)
-      .map((p) => state.proposals.find((pr) => pr.proposerId === p)?.id)
-      .filter((id): id is string => Boolean(id))
-      .sort();
-    const digest = shortHash(includedIds.join(","));
-
-    for (let voterId = 0; voterId < n; voterId++) {
-      for (let recipient = 0; recipient < n; recipient++) {
-        dispatch({
-          type: "SEND",
-          from: voterId,
-          to: recipient,
-          msgType: "commit",
-          payload: { voterId, digest },
-          delay: deliveryDelay(),
-        });
-      }
-    }
-
-    dispatch({ type: "COMMIT_VOTE" });
-  }, [state.committed, state.specAt, state.validators.length, state.proposers, state.tallies, state.proposals]);
-
-  return { state, running, setN, reset, send, propose, firstVote, commitVote };
+  return { state, running, setN, reset, setTau, setAutoRun, manualPropose, manualFirstVote, manualCommitVote };
 }
