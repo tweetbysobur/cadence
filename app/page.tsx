@@ -45,6 +45,8 @@ export default function Home() {
     reset,
     setTau,
     setAutoRun,
+    setOutage,
+    armFaultyProposer,
     manualPropose,
     manualFirstVote,
     manualCommitVote,
@@ -60,6 +62,11 @@ export default function Home() {
   const inFlightSlots = useMemo(
     () => state.slots.filter((s) => state.clock >= s.deadlineAt).length,
     [state.slots, state.clock]
+  );
+  const pendingBlocks = useMemo(
+    () =>
+      Object.values(state.pending).sort((a, b) => a.slot - b.slot),
+    [state.pending]
   );
 
   const deadlineRemaining = focus ? Math.max(0, focus.deadlineAt - state.clock) : state.tau;
@@ -172,6 +179,29 @@ export default function Home() {
           >
             Auto-Run {state.autoRun ? "On" : "Off"}
           </button>
+          <button
+            type="button"
+            onClick={() => setOutage(!state.outage)}
+            className={`rounded-lg border px-4 py-2 text-sm font-medium transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-border ${
+              state.outage
+                ? "border-red-500/40 bg-red-500/15 text-red-400 hover:bg-red-500/25"
+                : "border-border bg-surface text-foreground hover:border-accent-border hover:text-accent"
+            }`}
+          >
+            Outage {state.outage ? "On" : "Off"}
+          </button>
+          <button
+            type="button"
+            onClick={armFaultyProposer}
+            disabled={state.faultySlot !== null}
+            className={
+              state.faultySlot !== null
+                ? "cursor-not-allowed rounded-lg border border-border-soft bg-surface/50 px-4 py-2 text-sm font-medium text-muted-soft opacity-60"
+                : "rounded-lg border border-border bg-surface px-4 py-2 text-sm font-medium text-foreground transition-colors duration-150 hover:border-accent-border hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-border"
+            }
+          >
+            {state.faultySlot !== null ? `Faulty Proposer (armed S${state.faultySlot})` : "Faulty Proposer"}
+          </button>
           <StageButton label="Propose" disabled={!canPropose} onClick={manualPropose} />
           <StageButton label="First Vote" disabled={!canFirstVote} onClick={manualFirstVote} />
           <StageButton label="Commit Vote" disabled={!canCommitVote} onClick={manualCommitVote} />
@@ -259,20 +289,40 @@ export default function Home() {
       {/* Chain */}
       <Panel title="Chain" subtitle="Finalized blocks">
         <div className="flex min-h-24 items-center gap-3 overflow-x-auto rounded-xl border border-border-soft bg-surface p-4">
-          {state.chain.length === 0 ? (
+          {state.chain.length === 0 && pendingBlocks.length === 0 ? (
             <p className="w-full text-center text-sm text-muted-soft">No finalized blocks yet.</p>
           ) : (
-            state.chain.map((block, i) => (
-              <div
-                key={i}
-                className="flex h-20 w-36 flex-shrink-0 flex-col justify-center gap-1 rounded-lg border border-success/40 bg-success-soft px-3 py-2 text-success"
-              >
-                <span className="text-xs font-semibold">Slot {block.slot}</span>
-                <span className="font-mono text-[11px]">{block.txCount} tx</span>
-                <span className="font-mono text-[10px] text-success/80">spec: {block.specMs}ms</span>
-                <span className="font-mono text-[10px] text-success/80">final: {block.finalMs}ms</span>
-              </div>
-            ))
+            <>
+              {state.chain.map((block, i) => (
+                <div
+                  key={`chain-${i}`}
+                  className={`flex h-20 w-36 flex-shrink-0 flex-col justify-center gap-1 rounded-lg border px-3 py-2 ${
+                    block.skipped
+                      ? "border-border-soft bg-white/5 text-muted-soft"
+                      : "border-success/40 bg-success-soft text-success"
+                  }`}
+                >
+                  <span className="text-xs font-semibold">Slot {block.slot}</span>
+                  {block.skipped ? (
+                    <span className="text-[10px] font-semibold uppercase tracking-wide">Skipped</span>
+                  ) : (
+                    <span className="font-mono text-[11px]">{block.txCount} tx</span>
+                  )}
+                  <span className="font-mono text-[10px] opacity-80">spec: {block.specMs}ms</span>
+                  <span className="font-mono text-[10px] opacity-80">final: {block.finalMs}ms</span>
+                </div>
+              ))}
+              {pendingBlocks.map((block) => (
+                <div
+                  key={`pending-${block.slot}`}
+                  className="flex h-20 w-36 flex-shrink-0 flex-col justify-center gap-1 rounded-lg border border-border-soft bg-surface/60 px-3 py-2 text-muted-soft opacity-50"
+                >
+                  <span className="text-xs font-semibold">Slot {block.slot}</span>
+                  <span className="font-mono text-[11px]">{block.txCount} tx</span>
+                  <span className="font-mono text-[10px]">waiting for slot {state.nextChainSlot}</span>
+                </div>
+              ))}
+            </>
           )}
         </div>
       </Panel>

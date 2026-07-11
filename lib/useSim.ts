@@ -24,9 +24,23 @@ export function useSim(defaultN: number) {
   const reset = useCallback(() => dispatch({ type: "RESET" }), []);
   const setTau = useCallback((tau: number) => dispatch({ type: "SET_TAU", tau }), []);
   const setAutoRun = useCallback((on: boolean) => dispatch({ type: "SET_AUTO_RUN", on }), []);
+  const setOutage = useCallback((on: boolean) => dispatch({ type: "SET_OUTAGE", on }), []);
+  const armFaultyProposer = useCallback(() => dispatch({ type: "ARM_FAULTY_PROPOSER" }), []);
   const manualPropose = useCallback(() => dispatch({ type: "MANUAL_PROPOSE" }), []);
   const manualFirstVote = useCallback(() => dispatch({ type: "MANUAL_FIRST_VOTE" }), []);
   const manualCommitVote = useCallback(() => dispatch({ type: "MANUAL_COMMIT_VOTE" }), []);
 
-  return { state, running, setN, reset, setTau, setAutoRun, manualPropose, manualFirstVote, manualCommitVote };
+  return {
+    state,
+    running,
+    setN,
+    reset,
+    setTau,
+    setAutoRun,
+    setOutage,
+    armFaultyProposer,
+    manualPropose,
+    manualFirstVote,
+    manualCommitVote,
+  };
 }

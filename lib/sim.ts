@@ -62,6 +62,8 @@ export interface SlotState {
   committed: boolean;
   keyPieces: number[];
   decrypted: boolean;
+  /** True if this slot's proposer(s) were made to go silent (Faulty Proposer). */
+  faulty: boolean;
 }
 
 export interface Block {
@@ -69,13 +71,15 @@ export interface Block {
   txCount: number;
   specMs: number;
   finalMs: number;
+  /** True if this block resolved via the faulty-proposer timeout, not a real quorum. */
+  skipped?: boolean;
 }
 
 export interface SimState {
   clock: number;
   tau: number;
   autoRun: boolean;
-  /** Reserved for a future network-outage step; unused so far. */
+  /** While true, no messages are delivered — they queue in inFlight. */
   outage: boolean;
   validators: Validator[];
   slots: SlotState[];
@@ -90,6 +94,10 @@ export interface SimState {
   /** Conductor: the slot number and clock time for the next auto-propose. */
   nextSlotNumber: number;
   nextProposeAt: number;
+  /** True while the Conductor is blocked by the brake (10 unfinalized slots). */
+  stalled: boolean;
+  /** The next slot number to silence, armed by the Faulty Proposer button. */
+  faultySlot: number | null;
 }
 
 /** The single validator whose inbox drives every slot's tallies. */
@@ -97,6 +105,10 @@ const OBSERVER_ID = 0;
 const MAX_LOG = 200;
 export const DEFAULT_TAU = 150;
 const INITIAL_SLOT = 1;
+/** Windows of 8 open the next window once 6 have finalized: 8 + (8-6) = 10. */
+const BRAKE_CAP = 10;
+/** A faulty slot gives up and finalizes empty this long after its deadline. */
+const SKIP_TIMEOUT_MULT = 2;
 
 /**
  * Proposers rotate by one validator per slot: slot 1 -> [0,1,2],
@@ -154,6 +166,8 @@ export function createInitialState(n: number, tau: number = DEFAULT_TAU): SimSta
     manualSlot: null,
     nextSlotNumber: INITIAL_SLOT,
     nextProposeAt: tau,
+    stalled: false,
+    faultySlot: null,
   };
 }
 
@@ -162,6 +176,8 @@ export type SimAction =
   | { type: "RESET" }
   | { type: "SET_TAU"; tau: number }
   | { type: "SET_AUTO_RUN"; on: boolean }
+  | { type: "SET_OUTAGE"; on: boolean }
+  | { type: "ARM_FAULTY_PROPOSER" }
   | { type: "TICK"; step: number }
   | { type: "MANUAL_PROPOSE" }
   | { type: "MANUAL_FIRST_VOTE" }
@@ -189,32 +205,38 @@ function formatDelivery(m: SimMessage): string {
   return `[${m.arrivesAt}ms] ${tag} Validator ${m.from} -> Validator ${m.to}: ${m.type}`;
 }
 
-/** Creates a new slot: a proposal per proposer, split into N chunks each. */
+/** Creates a new slot: a proposal per proposer, split into N chunks each. A
+ *  faulty slot's proposer(s) go silent — no proposals, no chunks sent. */
 function buildProposal(
   slotNum: number,
   n: number,
   clock: number,
-  tau: number
+  tau: number,
+  faulty: boolean
 ): { slot: SlotState; messages: SimMessage[] } {
   const proposers = proposersForSlot(slotNum, n);
-  const proposals: Proposal[] = proposers.map((proposerId) => {
-    const txIds = Array.from({ length: 3 }, () => Math.random().toString(16).slice(2, 10));
-    const id = shortHash(`${proposerId}:${txIds.join(",")}`);
-    return { proposerId, id, txIds, locked: true };
-  });
+  const proposals: Proposal[] = faulty
+    ? []
+    : proposers.map((proposerId) => {
+        const txIds = Array.from({ length: 3 }, () => Math.random().toString(16).slice(2, 10));
+        const id = shortHash(`${proposerId}:${txIds.join(",")}`);
+        return { proposerId, id, txIds, locked: true };
+      });
 
   const messages: SimMessage[] = [];
-  for (const p of proposals) {
-    for (let v = 0; v < n; v++) {
-      messages.push({
-        from: p.proposerId,
-        to: v,
-        slot: slotNum,
-        type: "chunk",
-        payload: { proposerId: p.proposerId, chunkIndex: v, id: p.id },
-        sentAt: clock,
-        arrivesAt: clock + jitter(),
-      });
+  if (!faulty) {
+    for (const p of proposals) {
+      for (let v = 0; v < n; v++) {
+        messages.push({
+          from: p.proposerId,
+          to: v,
+          slot: slotNum,
+          type: "chunk",
+          payload: { proposerId: p.proposerId, chunkIndex: v, id: p.id },
+          sentAt: clock,
+          arrivesAt: clock + jitter(),
+        });
+      }
     }
   }
 
@@ -232,6 +254,7 @@ function buildProposal(
     committed: false,
     keyPieces: [],
     decrypted: false,
+    faulty,
   };
   return { slot, messages };
 }
@@ -307,6 +330,8 @@ function tick(state: SimState, step: number): SimState {
   let inFlight = state.inFlight.slice();
   let nextSlotNumber = state.nextSlotNumber;
   let nextProposeAt = state.nextProposeAt;
+  let stalled = state.stalled;
+  let faultySlot = state.faultySlot;
   const validators = state.validators.map((v) => ({ ...v, inbox: v.inbox.slice() }));
   const log = state.log.slice();
   let pending = state.pending;
@@ -314,22 +339,50 @@ function tick(state: SimState, step: number): SimState {
   let chain = state.chain;
   let manualSlot = state.manualSlot;
 
-  // A) Conductor: auto-propose a new slot every tau, independent of earlier slots.
-  if (state.autoRun) {
-    let guard = 0;
-    while (clock >= nextProposeAt && guard < 50) {
-      const { slot, messages } = buildProposal(nextSlotNumber, n, nextProposeAt, state.tau);
-      slots.push(slot);
-      inFlight.push(...messages);
-      nextSlotNumber += 1;
-      nextProposeAt += state.tau;
-      guard += 1;
+  // A) Conductor: auto-propose a new slot every tau, independent of earlier
+  //    slots — but the brake blocks it once BRAKE_CAP slots are unfinalized.
+  //    On resume it schedules "from now" rather than catching up, leaving a
+  //    visible gap in the deadline schedule.
+  if (state.autoRun && clock >= nextProposeAt) {
+    if (slots.length >= BRAKE_CAP) {
+      if (!stalled) {
+        stalled = true;
+        pushLog(log, `[${clock}ms] Conductor stalled — ${BRAKE_CAP} unfinalized slots in flight`);
+      }
+    } else {
+      if (stalled) {
+        nextProposeAt = clock + state.tau;
+        stalled = false;
+        pushLog(log, `[${clock}ms] Conductor resumed`);
+      }
+      let guard = 0;
+      while (clock >= nextProposeAt && slots.length < BRAKE_CAP && guard < 50) {
+        const faulty = faultySlot !== null && nextSlotNumber === faultySlot;
+        const { slot, messages } = buildProposal(nextSlotNumber, n, nextProposeAt, state.tau, faulty);
+        if (faulty) {
+          faultySlot = null;
+          pushLog(log, `[${clock}ms] S${slot.slot} proposer silent (Faulty Proposer)`);
+        }
+        slots.push(slot);
+        inFlight.push(...messages);
+        nextSlotNumber += 1;
+        nextProposeAt += state.tau;
+        guard += 1;
+      }
+      if (slots.length >= BRAKE_CAP && clock >= nextProposeAt) {
+        stalled = true;
+        pushLog(log, `[${clock}ms] Conductor stalled — ${BRAKE_CAP} unfinalized slots in flight`);
+      }
     }
   }
 
-  // B) Deliver every message whose arrival time has passed.
-  const arrived = inFlight.filter((m) => m.arrivesAt <= clock);
-  inFlight = inFlight.filter((m) => m.arrivesAt > clock);
+  // B) Deliver every message whose arrival time has passed — paused during
+  //    an outage (messages just queue in inFlight; the clock keeps moving).
+  let arrived: SimMessage[] = [];
+  if (!state.outage) {
+    arrived = inFlight.filter((m) => m.arrivesAt <= clock);
+    inFlight = inFlight.filter((m) => m.arrivesAt > clock);
+  }
 
   for (const m of arrived) {
     validators[m.to].inbox.push(m);
@@ -380,30 +433,51 @@ function tick(state: SimState, step: number): SimState {
     }
   }
 
-  // D) Finalize: on quorum matching commit votes, build the block and retire the slot.
+  // D) Finalize: on quorum matching commit votes, build the block and retire
+  //    the slot. A faulty slot instead times out (deadline + 2*tau) and
+  //    finalizes as an empty SKIPPED block, since it never gathers votes.
   const stillActive: SlotState[] = [];
   let newPending: Record<number, Block> | null = null;
   for (const slotState of slots) {
     let finalizedBlock: Block | null = null;
-    for (const digest of Object.keys(slotState.commitVotes)) {
-      if (slotState.commitVotes[digest].length >= quorum) {
-        const includedProposers = slotState.proposers.filter((p) => (slotState.votes[p]?.yes.length ?? 0) >= quorum);
-        const txSet = new Set<string>();
-        for (const p of includedProposers) {
-          const proposal = slotState.proposals.find((pr) => pr.proposerId === p);
-          if (proposal) for (const tx of proposal.txIds) txSet.add(tx);
-        }
+
+    if (slotState.faulty) {
+      if (clock >= slotState.deadlineAt + SKIP_TIMEOUT_MULT * state.tau) {
         finalizedBlock = {
           slot: slotState.slot,
-          txCount: txSet.size,
-          specMs: (slotState.speculativeAt ?? clock) - slotState.deadlineAt,
+          txCount: 0,
+          specMs: clock - slotState.deadlineAt,
           finalMs: clock - slotState.deadlineAt,
+          skipped: true,
         };
-        break;
+      }
+    } else {
+      for (const digest of Object.keys(slotState.commitVotes)) {
+        if (slotState.commitVotes[digest].length >= quorum) {
+          const includedProposers = slotState.proposers.filter((p) => (slotState.votes[p]?.yes.length ?? 0) >= quorum);
+          const txSet = new Set<string>();
+          for (const p of includedProposers) {
+            const proposal = slotState.proposals.find((pr) => pr.proposerId === p);
+            if (proposal) for (const tx of proposal.txIds) txSet.add(tx);
+          }
+          finalizedBlock = {
+            slot: slotState.slot,
+            txCount: txSet.size,
+            specMs: (slotState.speculativeAt ?? clock) - slotState.deadlineAt,
+            finalMs: clock - slotState.deadlineAt,
+          };
+          break;
+        }
       }
     }
+
     if (finalizedBlock) {
-      pushLog(log, `[${clock}ms] S${slotState.slot} finalized. Included proposals merge into one block.`);
+      pushLog(
+        log,
+        finalizedBlock.skipped
+          ? `[${clock}ms] S${slotState.slot} deadline+timeout passed — proposer silent, finalized as SKIPPED (empty block)`
+          : `[${clock}ms] S${slotState.slot} finalized. Included proposals merge into one block.`
+      );
       if (!newPending) newPending = { ...pending };
       newPending[slotState.slot] = finalizedBlock;
       if (manualSlot === slotState.slot) manualSlot = null;
@@ -414,7 +488,9 @@ function tick(state: SimState, step: number): SimState {
   slots = stillActive;
   if (newPending) pending = newPending;
 
-  // E) Flush contiguous finalized blocks into the chain, in slot order.
+  // E) Flush contiguous finalized blocks into the chain, in slot order —
+  //    finalization can land out of order, so gaps hold in `pending` and
+  //    drain in a burst once the missing slot arrives.
   if (pending[nextChainSlot] !== undefined) {
     const newChain = chain.slice();
     const rest = { ...pending };
@@ -427,11 +503,13 @@ function tick(state: SimState, step: number): SimState {
     pending = rest;
   }
 
-  // F) Auto-Run: fire first votes at each slot's deadline, commit votes once speculatively final.
+  // F) Auto-Run: fire first votes at each slot's deadline, commit votes once
+  //    speculatively final. Faulty slots never vote — they only resolve via
+  //    the timeout in step D.
   if (state.autoRun) {
     for (let i = 0; i < slots.length; i++) {
       const slotState = slots[i];
-      if (!slotState.firstVoted && clock >= slotState.deadlineAt) {
+      if (!slotState.faulty && !slotState.firstVoted && clock >= slotState.deadlineAt) {
         const messages = buildFirstVotes(slotState, validators, n, clock);
         inFlight.push(...messages);
         slots[i] = { ...slotState, firstVoted: true };
@@ -439,7 +517,7 @@ function tick(state: SimState, step: number): SimState {
     }
     for (let i = 0; i < slots.length; i++) {
       const slotState = slots[i];
-      if (slotState.speculativeAt !== null && !slotState.committed) {
+      if (!slotState.faulty && slotState.speculativeAt !== null && !slotState.committed) {
         const messages = buildCommitVotes(slotState, n, clock, quorum);
         inFlight.push(...messages);
         slots[i] = { ...slotState, committed: true };
@@ -460,6 +538,8 @@ function tick(state: SimState, step: number): SimState {
     nextSlotNumber,
     nextProposeAt,
     manualSlot,
+    stalled,
+    faultySlot,
   };
 }
 
@@ -479,20 +559,29 @@ export function simReducer(state: SimState, action: SimAction): SimState {
         slots: [],
         inFlight: [],
         manualSlot: null,
+        stalled: false,
         nextProposeAt: action.on ? state.clock : state.nextProposeAt,
       };
+    }
+    case "SET_OUTAGE": {
+      return { ...state, outage: action.on };
+    }
+    case "ARM_FAULTY_PROPOSER": {
+      return { ...state, faultySlot: state.nextSlotNumber };
     }
     case "MANUAL_PROPOSE": {
       if (state.autoRun || state.manualSlot !== null) return state;
       const n = state.validators.length;
       const slotNum = state.nextSlotNumber;
-      const { slot, messages } = buildProposal(slotNum, n, state.clock, state.tau);
+      const faulty = state.faultySlot !== null && slotNum === state.faultySlot;
+      const { slot, messages } = buildProposal(slotNum, n, state.clock, state.tau, faulty);
       return {
         ...state,
         slots: [...state.slots, slot],
         inFlight: [...state.inFlight, ...messages],
         nextSlotNumber: slotNum + 1,
         manualSlot: slotNum,
+        faultySlot: faulty ? null : state.faultySlot,
       };
     }
     case "MANUAL_FIRST_VOTE": {
