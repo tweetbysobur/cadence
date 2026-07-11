@@ -1,8 +1,18 @@
 export type ValidatorStatus = "Idle";
 
+export interface SimMessage {
+  from: number;
+  to: number;
+  type: string;
+  payload?: unknown;
+  sentAt: number;
+  arrivesAt: number;
+  label?: string;
+}
+
 export interface Validator {
   id: number;
-  inbox: unknown[];
+  inbox: SimMessage[];
   status: ValidatorStatus;
 }
 
@@ -12,6 +22,7 @@ export interface SimState {
   clock: number;
   validators: Validator[];
   proposers: number[];
+  inFlight: SimMessage[];
   log: string[];
   chain: unknown[];
 }
@@ -42,6 +53,15 @@ export function deriveThresholds(n: number): Thresholds {
 const DEADLINE_MS = 150;
 const INITIAL_SLOT = 1;
 
+/**
+ * Simulated network latency: 60ms +/- 30ms, i.e. uniform in [30, 90]ms.
+ * Called at the call site (action creators), never inside the reducer,
+ * so the reducer stays a pure function of (state, action).
+ */
+export function deliveryDelay(): number {
+  return Math.round(60 + (Math.random() * 2 - 1) * 30);
+}
+
 export function createInitialState(n: number): SimState {
   return {
     slot: INITIAL_SLOT,
@@ -53,12 +73,21 @@ export function createInitialState(n: number): SimState {
       status: "Idle",
     })),
     proposers: proposersForSlot(INITIAL_SLOT, n),
+    inFlight: [],
     log: [],
     chain: [],
   };
 }
 
-export type SimAction = { type: "SET_N"; n: number } | { type: "RESET"; n: number };
+export type SimAction =
+  | { type: "SET_N"; n: number }
+  | { type: "RESET"; n: number }
+  | { type: "SEND"; from: number; to: number; msgType: string; payload?: unknown; delay: number; label?: string }
+  | { type: "TICK"; step: number };
+
+function formatDelivery(m: SimMessage): string {
+  return `[${m.arrivesAt}ms] Validator ${m.from} -> Validator ${m.to}: ${m.type}`;
+}
 
 export function simReducer(state: SimState, action: SimAction): SimState {
   switch (action.type) {
@@ -66,6 +95,34 @@ export function simReducer(state: SimState, action: SimAction): SimState {
       return createInitialState(action.n);
     case "RESET":
       return createInitialState(action.n);
+    case "SEND": {
+      const sentAt = state.clock;
+      const message: SimMessage = {
+        from: action.from,
+        to: action.to,
+        type: action.msgType,
+        payload: action.payload,
+        sentAt,
+        arrivesAt: sentAt + action.delay,
+        label: action.label,
+      };
+      return { ...state, inFlight: [...state.inFlight, message] };
+    }
+    case "TICK": {
+      const clock = state.clock + action.step;
+      const arrived = state.inFlight.filter((m) => m.arrivesAt <= clock);
+      if (arrived.length === 0) {
+        return { ...state, clock };
+      }
+      const stillInFlight = state.inFlight.filter((m) => m.arrivesAt > clock);
+      const validators = state.validators.map((v) => ({ ...v, inbox: v.inbox.slice() }));
+      const log = state.log.slice();
+      for (const m of arrived) {
+        validators[m.to].inbox.push(m);
+        log.push(formatDelivery(m));
+      }
+      return { ...state, clock, inFlight: stillInFlight, validators, log };
+    }
     default:
       return state;
   }

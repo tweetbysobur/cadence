@@ -1,15 +1,15 @@
 "use client";
 
-import { useReducer } from "react";
 import { HoverStat } from "@/components/HoverStat";
-import { createInitialState, deriveThresholds, simReducer } from "@/lib/sim";
+import { deriveThresholds } from "@/lib/sim";
+import { useSim } from "@/lib/useSim";
 
 const MIN_N = 4;
 const MAX_N = 22;
 const DEFAULT_N = 10;
 
 export default function Home() {
-  const [state, dispatch] = useReducer(simReducer, DEFAULT_N, createInitialState);
+  const { state, running, setN, reset } = useSim(DEFAULT_N);
   const n = state.validators.length;
   const { f, quorum, rebuild } = deriveThresholds(n);
   const sliderFill = ((n - MIN_N) / (MAX_N - MIN_N)) * 100;
@@ -38,7 +38,7 @@ export default function Home() {
             max={MAX_N}
             step={1}
             value={n}
-            onChange={(e) => dispatch({ type: "SET_N", n: Number(e.target.value) })}
+            onChange={(e) => setN(Number(e.target.value))}
             aria-label="Number of validators"
           />
         </div>
@@ -51,7 +51,16 @@ export default function Home() {
           <Divider />
           <Stat label="Deadline" value={`${state.deadlineMs} ms`} />
           <Divider />
-          <Stat label="Clock" value={`${state.clock} ms`} mono />
+          <div className="flex items-center gap-2">
+            <Stat label="Clock" value={`${state.clock} ms`} mono />
+            <span
+              aria-hidden
+              className={`relative flex h-2 w-2 ${running ? "opacity-100" : "opacity-0"}`}
+            >
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-75" />
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-success" />
+            </span>
+          </div>
           <Divider />
           <HoverStat
             label="Quorum"
@@ -72,7 +81,7 @@ export default function Home() {
           <StageButton label="Commit Vote" />
           <button
             type="button"
-            onClick={() => dispatch({ type: "RESET", n })}
+            onClick={() => reset(n)}
             className="rounded-lg border border-border bg-surface px-4 py-2 text-sm font-medium text-foreground transition-colors duration-150 hover:border-accent-border hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-border"
           >
             Reset
