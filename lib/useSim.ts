@@ -5,6 +5,7 @@ import {
   ChunkPayload,
   createInitialState,
   deliveryDelay,
+  deriveThresholds,
   shortHash,
   simReducer,
   VotePayload,
@@ -115,5 +116,38 @@ export function useSim(defaultN: number) {
     dispatch({ type: "FIRST_VOTE" });
   }, [state.votesCast, state.validators, state.proposers, state.deadlineAt]);
 
-  return { state, running, setN, reset, send, propose, firstVote };
+  /**
+   * Once every proposer has decided (speculative finality), every validator
+   * broadcasts a commit vote carrying a digest of its recorded
+   * included-proposal set to every validator.
+   */
+  const commitVote = useCallback(() => {
+    if (state.committed || state.specAt === null) return;
+    const n = state.validators.length;
+    const { quorum } = deriveThresholds(n);
+
+    const includedIds = state.proposers
+      .filter((p) => (state.tallies[p]?.yes.length ?? 0) >= quorum)
+      .map((p) => state.proposals.find((pr) => pr.proposerId === p)?.id)
+      .filter((id): id is string => Boolean(id))
+      .sort();
+    const digest = shortHash(includedIds.join(","));
+
+    for (let voterId = 0; voterId < n; voterId++) {
+      for (let recipient = 0; recipient < n; recipient++) {
+        dispatch({
+          type: "SEND",
+          from: voterId,
+          to: recipient,
+          msgType: "commit",
+          payload: { voterId, digest },
+          delay: deliveryDelay(),
+        });
+      }
+    }
+
+    dispatch({ type: "COMMIT_VOTE" });
+  }, [state.committed, state.specAt, state.validators.length, state.proposers, state.tallies, state.proposals]);
+
+  return { state, running, setN, reset, send, propose, firstVote, commitVote };
 }

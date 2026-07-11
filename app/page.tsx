@@ -10,7 +10,7 @@ const MAX_N = 22;
 const DEFAULT_N = 10;
 
 export default function Home() {
-  const { state, running, setN, reset, propose, firstVote } = useSim(DEFAULT_N);
+  const { state, running, setN, reset, propose, firstVote, commitVote } = useSim(DEFAULT_N);
   const n = state.validators.length;
   const { f, quorum, rebuild } = deriveThresholds(n);
   const outThreshold = n - quorum + 1;
@@ -21,6 +21,7 @@ export default function Home() {
   const deadlinePassed = state.deadlineAt !== null && state.clock >= state.deadlineAt;
   const canPropose = state.proposals.length === 0;
   const canFirstVote = deadlinePassed && !state.votesCast;
+  const canCommitVote = state.specAt !== null && !state.committed;
 
   return (
     <div className="mx-auto flex w-full max-w-[1150px] flex-1 flex-col gap-6 px-6 py-10">
@@ -86,7 +87,7 @@ export default function Home() {
         <div className="flex flex-wrap items-center gap-2">
           <StageButton label="Propose" disabled={!canPropose} onClick={propose} />
           <StageButton label="First Vote" disabled={!canFirstVote} onClick={firstVote} />
-          <StageButton label="Commit Vote" disabled />
+          <StageButton label="Commit Vote" disabled={!canCommitVote} onClick={commitVote} />
           <button
             type="button"
             onClick={() => reset(n)}
@@ -170,12 +171,19 @@ export default function Home() {
           {state.chain.length === 0 ? (
             <p className="w-full text-center text-sm text-muted-soft">No finalized blocks yet.</p>
           ) : (
-            state.chain.map((_, i) => (
+            state.chain.map((block, i) => (
               <div
                 key={i}
-                className="flex h-16 w-28 flex-shrink-0 items-center justify-center rounded-lg border border-success/40 bg-success-soft text-xs font-semibold text-success"
+                className="flex h-20 w-36 flex-shrink-0 flex-col justify-center gap-1 rounded-lg border border-success/40 bg-success-soft px-3 py-2 text-success"
               >
-                Block {i}
+                <span className="text-xs font-semibold">Slot {block.slot}</span>
+                <span className="font-mono text-[11px]">{block.txCount} tx</span>
+                <span className="font-mono text-[10px] text-success/80">
+                  spec: {block.specMs}ms
+                </span>
+                <span className="font-mono text-[10px] text-success/80">
+                  final: {block.finalMs}ms
+                </span>
               </div>
             ))
           )}
